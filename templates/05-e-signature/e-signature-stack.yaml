@@ -1,0 +1,715 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  21 CFR Part 11.50 Electronic Signature Infrastructure Stack.
+  Deploys Cognito (identity verification), DynamoDB (signature records with PITR),
+  Lambda functions (re-authentication and signature creation), Step Functions
+  (orchestration), SNS (notifications), and API Gateway (REST endpoint).
+  Implements Part 11.50 (signature content), 11.70 (signature/record linking),
+  and 11.100 (uniqueness and re-authentication requirements).
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket containing Lambda deployment packages
+
+  ReAuthLambdaKey:
+    Type: String
+    Default: e-signature/reauth_lambda.zip
+    Description: S3 key for the re-authentication Lambda package
+
+  SignatureRecordLambdaKey:
+    Type: String
+    Default: e-signature/signature_record_lambda.zip
+    Description: S3 key for the signature record Lambda package
+
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Email address for signature notification subscription (optional)
+
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+
+Resources:
+  # =============================================================================
+  # COGNITO - Identity Verification (11.100)
+  # =============================================================================
+  SignerUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub 'gxp-esignature-signers-${Environment}'
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 14
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 1
+      Schema:
+        - Name: given_name
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: family_name
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      AutoVerifiedAttributes:
+        - email
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      UserPoolAddOns:
+        AdvancedSecurityMode: ENFORCED
+      UserPoolTags:
+        GxP-Classification: High-Process-Risk
+        Regulation: 21-CFR-Part-11
+
+  SignerUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub 'gxp-esignature-client-${Environment}'
+      UserPoolId: !Ref SignerUserPool
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: hours
+      AccessTokenValidity: 15
+      IdTokenValidity: 15
+      RefreshTokenValidity: 1
+
+  # =============================================================================
+  # DYNAMODB - Signature Record Storage (11.50, 11.70)
+  # =============================================================================
+  SignatureTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub 'gxp-signature-records-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: record_id
+          AttributeType: S
+        - AttributeName: signature_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: record_id
+          KeyType: HASH
+        - AttributeName: signature_id
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: Regulation
+          Value: 21-CFR-Part-11
+        - Key: DataRetention
+          Value: Permanent
+
+  # =============================================================================
+  # SNS - Signature Notifications
+  # =============================================================================
+  SignatureNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'gxp-signature-notifications-${Environment}'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: Regulation
+          Value: 21-CFR-Part-11
+
+  SignatureNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref SignatureNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # =============================================================================
+  # IAM ROLES
+  # =============================================================================
+  ReAuthLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'gxp-reauth-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: CognitoAuthPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminInitiateAuth
+                Resource: !GetAtt SignerUserPool.Arn
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: Regulation
+          Value: 21-CFR-Part-11
+
+  SignatureRecordLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'gxp-signature-record-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: DynamoDBWritePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt SignatureTable.Arn
+        - PolicyName: CognitoReadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminGetUser
+                Resource: !GetAtt SignerUserPool.Arn
+        - PolicyName: STSPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: '*'
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: Regulation
+          Value: 21-CFR-Part-11
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'gxp-esignature-sfn-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ReAuthLambdaFunction.Arn
+                  - !GetAtt SignatureRecordLambdaFunction.Arn
+        - PolicyName: PublishSNSPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SignatureNotificationTopic
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: '*'
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: Regulation
+          Value: 21-CFR-Part-11
+
+  ApiGatewayExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'gxp-esignature-apigw-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref ESignatureStateMachine
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: Regulation
+          Value: 21-CFR-Part-11
+
+  # =============================================================================
+  # LAMBDA FUNCTIONS
+  # =============================================================================
+  ReAuthLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'gxp-esignature-reauth-${Environment}'
+      Description: >
+        Re-authenticates the signer at signing time per 21 CFR Part 11.50.
+        Verifies identity via Cognito USER_PASSWORD_AUTH before signature creation.
+      Runtime: python3.12
+      Handler: reauth_lambda.handler
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref ReAuthLambdaKey
+      Role: !GetAtt ReAuthLambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          COGNITO_USER_POOL_ID: !Ref SignerUserPool
+          COGNITO_CLIENT_ID: !Ref SignerUserPoolClient
+      TracingConfig:
+        Mode: Active
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: Regulation
+          Value: 21-CFR-Part-11
+
+  SignatureRecordLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'gxp-esignature-record-${Environment}'
+      Description: >
+        Creates Part 11.50-compliant signature records with printed name (a)(1),
+        server-generated timestamp (a)(2), meaning (a)(3), and SHA-256 hash
+        for 11.70 signature-record cryptographic linking.
+      Runtime: python3.12
+      Handler: signature_record_lambda.handler
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref SignatureRecordLambdaKey
+      Role: !GetAtt SignatureRecordLambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          SIGNATURE_TABLE_NAME: !Ref SignatureTable
+          COGNITO_USER_POOL_ID: !Ref SignerUserPool
+      TracingConfig:
+        Mode: Active
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: Regulation
+          Value: 21-CFR-Part-11
+
+  # =============================================================================
+  # STEP FUNCTIONS - E-Signature Workflow Orchestration
+  # =============================================================================
+  ESignatureStateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/states/gxp-esignature-workflow-${Environment}'
+      RetentionInDays: 3653
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: Regulation
+          Value: 21-CFR-Part-11
+
+  ESignatureStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub 'gxp-esignature-workflow-${Environment}'
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      TracingConfiguration:
+        Enabled: true
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt ESignatureStateMachineLogGroup.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "21 CFR Part 11.50 E-Signature Workflow",
+          "StartAt": "RequestSignature",
+          "States": {
+            "RequestSignature": {
+              "Type": "Pass",
+              "Comment": "Receive and validate the signing request",
+              "Parameters": {
+                "username.$": "$.username",
+                "password.$": "$.password",
+                "record_id.$": "$.record_id",
+                "signature_meaning.$": "$.signature_meaning"
+              },
+              "Next": "ReAuthenticate"
+            },
+            "ReAuthenticate": {
+              "Type": "Task",
+              "Comment": "Re-authenticate signer at signing time per 11.50",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ReAuthLambdaFunction.Arn}",
+                "Payload.$": "$"
+              },
+              "ResultPath": "$.authResult",
+              "ResultSelector": {
+                "statusCode.$": "$.Payload.statusCode",
+                "authenticated.$": "$.Payload.authenticated",
+                "username.$": "$.Payload.username",
+                "auth_token.$": "$.Payload.auth_token",
+                "record_id.$": "$.Payload.record_id",
+                "signature_meaning.$": "$.Payload.signature_meaning",
+                "error.$": "$.Payload.error"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.errorInfo",
+                  "Next": "AuthFailed"
+                }
+              ],
+              "Next": "CheckAuthResult"
+            },
+            "CheckAuthResult": {
+              "Type": "Choice",
+              "Comment": "Route based on authentication result",
+              "Choices": [
+                {
+                  "Variable": "$.authResult.authenticated",
+                  "BooleanEquals": false,
+                  "Next": "AuthFailed"
+                },
+                {
+                  "Variable": "$.authResult.authenticated",
+                  "BooleanEquals": true,
+                  "Next": "CreateSignatureRecord"
+                }
+              ],
+              "Default": "AuthFailed"
+            },
+            "AuthFailed": {
+              "Type": "Fail",
+              "Cause": "Re-authentication failed per 21 CFR Part 11.50",
+              "Error": "ReAuthenticationFailed"
+            },
+            "CreateSignatureRecord": {
+              "Type": "Task",
+              "Comment": "Create 11.50-compliant signature record with 11.70 linking",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${SignatureRecordLambdaFunction.Arn}",
+                "Payload": {
+                  "username.$": "$.authResult.username",
+                  "record_id.$": "$.authResult.record_id",
+                  "signature_meaning.$": "$.authResult.signature_meaning",
+                  "auth_token.$": "$.authResult.auth_token"
+                }
+              },
+              "ResultPath": "$.signatureResult",
+              "ResultSelector": {
+                "statusCode.$": "$.Payload.statusCode",
+                "signature_record.$": "$.Payload.signature_record"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException",
+                    "Lambda.TooManyRequestsException"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.errorInfo",
+                  "Next": "SignatureCreationFailed"
+                }
+              ],
+              "Next": "NotifySigner"
+            },
+            "NotifySigner": {
+              "Type": "Task",
+              "Comment": "Send SNS notification confirming signature captured",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${SignatureNotificationTopic}",
+                "Subject": "Electronic Signature Captured - 21 CFR Part 11",
+                "Message.$": "States.Format('Signature captured successfully.\n\nRecord ID: {}\nSigner: {}\nMeaning: {}\nTimestamp: {}\nSignature ID: {}', $.signatureResult.signature_record.record_id, $.signatureResult.signature_record.printed_name, $.signatureResult.signature_record.meaning, $.signatureResult.signature_record.date_time, $.signatureResult.signature_record.signature_id)"
+              },
+              "ResultPath": "$.notificationResult",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.notificationError",
+                  "Next": "SignatureComplete"
+                }
+              ],
+              "Next": "SignatureComplete"
+            },
+            "SignatureComplete": {
+              "Type": "Succeed",
+              "Comment": "Signature workflow completed with full Part 11.50 record"
+            },
+            "SignatureCreationFailed": {
+              "Type": "Fail",
+              "Cause": "Signature record creation failed after authentication",
+              "Error": "SignatureRecordCreationFailed"
+            }
+          }
+        }
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: Regulation
+          Value: 21-CFR-Part-11
+
+  # =============================================================================
+  # API GATEWAY - REST Endpoint
+  # =============================================================================
+  ESignatureApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub 'gxp-esignature-api-${Environment}'
+      Description: >
+        REST API for 21 CFR Part 11.50 electronic signature workflow.
+        POST /sign initiates the Step Functions e-signature state machine.
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: Regulation
+          Value: 21-CFR-Part-11
+
+  SignResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ESignatureApi
+      ParentId: !GetAtt ESignatureApi.RootResourceId
+      PathPart: sign
+
+  SignMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ESignatureApi
+      ResourceId: !Ref SignResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:states:action/StartExecution'
+        Credentials: !GetAtt ApiGatewayExecutionRole.Arn
+        RequestTemplates:
+          application/json: !Sub |
+            {
+              "input": "$util.escapeJavaScript($input.body)",
+              "stateMachineArn": "${ESignatureStateMachine}"
+            }
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseTemplates:
+              application/json: |
+                {
+                  "executionArn": "$input.path('$.executionArn')",
+                  "startDate": "$input.path('$.startDate')"
+                }
+          - StatusCode: '400'
+            SelectionPattern: '4\d{2}'
+            ResponseTemplates:
+              application/json: '{"error": "Bad request"}'
+          - StatusCode: '500'
+            SelectionPattern: '5\d{2}'
+            ResponseTemplates:
+              application/json: '{"error": "Internal server error"}'
+      MethodResponses:
+        - StatusCode: '200'
+        - StatusCode: '400'
+        - StatusCode: '500'
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - SignMethod
+    Properties:
+      RestApiId: !Ref ESignatureApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ESignatureApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref Environment
+      TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp",
+          "caller":"$context.identity.caller","user":"$context.identity.user",
+          "requestTime":"$context.requestTime","httpMethod":"$context.httpMethod",
+          "resourcePath":"$context.resourcePath","status":"$context.status",
+          "protocol":"$context.protocol","responseLength":"$context.responseLength"}
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: Regulation
+          Value: 21-CFR-Part-11
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/gxp-esignature-api-${Environment}'
+      RetentionInDays: 3653
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: Regulation
+          Value: 21-CFR-Part-11
+
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID for signer management
+    Value: !Ref SignerUserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolId'
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref SignerUserPoolClient
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolClientId'
+
+  SignatureTableName:
+    Description: DynamoDB table for signature records
+    Value: !Ref SignatureTable
+    Export:
+      Name: !Sub '${AWS::StackName}-SignatureTableName'
+
+  SignatureTableArn:
+    Description: DynamoDB table ARN for signature records
+    Value: !GetAtt SignatureTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SignatureTableArn'
+
+  StateMachineArn:
+    Description: Step Functions state machine ARN for e-signature workflow
+    Value: !Ref ESignatureStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-StateMachineArn'
+
+  ApiEndpoint:
+    Description: API Gateway endpoint URL for the /sign endpoint
+    Value: !Sub 'https://${ESignatureApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/sign'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+  SignatureNotificationTopicArn:
+    Description: SNS topic ARN for signature notifications
+    Value: !Ref SignatureNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+
+  ReAuthLambdaArn:
+    Description: Re-authentication Lambda function ARN
+    Value: !GetAtt ReAuthLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ReAuthLambdaArn'
+
+  SignatureRecordLambdaArn:
+    Description: Signature record Lambda function ARN
+    Value: !GetAtt SignatureRecordLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SignatureRecordLambdaArn'

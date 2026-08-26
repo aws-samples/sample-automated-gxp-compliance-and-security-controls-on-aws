@@ -1,0 +1,231 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  GxP-Compliant S3 Storage with Object Lock, versioning, KMS encryption, and
+  access logging. Supports 21 CFR Part 11.10(e) - audit trails, EU Annex 11
+  Section 7 - data storage, and ALCOA+ principles for data integrity.
+  Retention enforced via Object Lock in COMPLIANCE mode.
+
+Parameters:
+  DataClassification:
+    Type: String
+    AllowedValues:
+      - High-Process-Risk
+      - Non-High-Process-Risk
+    Default: High-Process-Risk
+    Description: >-
+      GxP data classification per ISPE GAMP5. High-Process-Risk data requires
+      stricter controls, longer retention, and full validation lifecycle.
+
+  RetentionYears:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 25
+    Description: >-
+      Number of years to retain objects under COMPLIANCE Object Lock.
+      Default 7 years per FDA 21 CFR 211.180(a) record retention requirements.
+
+  KmsKeyArn:
+    Type: String
+    Description: ARN of the GxP KMS CMK for bucket encryption.
+    AllowedPattern: 'arn:aws:kms:.+:[0-9]{12}:key/.+'
+
+  Environment:
+    Type: String
+    AllowedValues:
+      - Production
+      - Validation
+      - Development
+    Default: Production
+    Description: Deployment environment for tagging.
+
+  BucketNameSuffix:
+    Type: String
+    Description: Unique suffix appended to bucket name (e.g., account ID or project code).
+    AllowedPattern: '[a-z0-9\-]+'
+    MaxLength: 32
+
+Resources:
+  # =========================================================================
+  # Access Logging Bucket
+  # =========================================================================
+  AccessLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'gxp-access-logs-${BucketNameSuffix}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref KmsKeyArn
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToGlacierAfter90Days
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+          - Id: ExpireAfterRetentionPeriod
+            Status: Enabled
+            ExpirationInDays: 2555
+      Tags:
+        - Key: GxP-Classification
+          Value: GxP-Supporting-Infrastructure
+        - Key: Purpose
+          Value: S3-Access-Logging
+        - Key: Environment
+          Value: !Ref Environment
+
+  AccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${AccessLogBucket.Arn}/*'
+            Condition:
+              ArnLike:
+                aws:SourceArn: !GetAtt GxPDataBucket.Arn
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: DenyUnencryptedTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AccessLogBucket.Arn
+              - !Sub '${AccessLogBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # =========================================================================
+  # GxP Data Bucket
+  # =========================================================================
+  GxPDataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'gxp-data-${BucketNameSuffix}-${AWS::Region}'
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: COMPLIANCE
+            Years: !Ref RetentionYears
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref KmsKeyArn
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: !Sub 'gxp-data-${BucketNameSuffix}/'
+      Tags:
+        - Key: GxP-Classification
+          Value: !Ref DataClassification
+        - Key: Data-Integrity
+          Value: ALCOA-Plus-Protected
+        - Key: ALCOA-Plus-Compliant
+          Value: 'true'
+        - Key: ALCOA-Attributable
+          Value: S3-Access-Logging-Enabled
+        - Key: ALCOA-Legible
+          Value: Versioning-Preserves-Readable-State
+        - Key: ALCOA-Contemporaneous
+          Value: Object-Lock-Timestamp-Immutable
+        - Key: ALCOA-Original
+          Value: Object-Lock-COMPLIANCE-Mode
+        - Key: ALCOA-Accurate
+          Value: KMS-Encryption-Integrity-Check
+        - Key: ALCOA-Complete
+          Value: Versioning-No-Deletions
+        - Key: ALCOA-Consistent
+          Value: Bucket-Policy-Enforced
+        - Key: ALCOA-Enduring
+          Value: !Sub 'Retention-${RetentionYears}-Years'
+        - Key: ALCOA-Available
+          Value: Cross-Region-Replication-Ready
+        - Key: Regulatory-Reference
+          Value: 21-CFR-Part-11.10(e)-EU-Annex-11-Sec-7
+        - Key: Retention-Years
+          Value: !Ref RetentionYears
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: aws-landing-zone
+          Value: gxp-compliance-automation
+
+  GxPDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref GxPDataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyUnencryptedTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt GxPDataBucket.Arn
+              - !Sub '${GxPDataBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+          - Sid: DenyNonKMSEncryptedUploads
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Sub '${GxPDataBucket.Arn}/*'
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: aws:kms
+
+          - Sid: DenyIncorrectKMSKey
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Sub '${GxPDataBucket.Arn}/*'
+            Condition:
+              StringNotEqualsIfExists:
+                s3:x-amz-server-side-encryption-aws-kms-key-id: !Ref KmsKeyArn
+
+Outputs:
+  BucketArn:
+    Description: ARN of the GxP-compliant data bucket
+    Value: !GetAtt GxPDataBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketArn'
+
+  BucketName:
+    Description: Name of the GxP-compliant data bucket
+    Value: !Ref GxPDataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'

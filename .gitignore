@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Build / packaging / deploy
+build/
+dist/
+*.zip
+.aws-sam/
+
+# Security scan tooling artifacts (must not be published)
+.ash/
+.holmes/
+.holmesignore
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Local environment / secrets
+.env
+*.local

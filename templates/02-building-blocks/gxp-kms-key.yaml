@@ -1,0 +1,164 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  GxP-Compliant KMS Customer Managed Key (CMK) with automatic key rotation.
+  Supports 21 CFR Part 11.10(d) - limiting system access to authorized individuals,
+  and EU Annex 11 Section 7 - data storage with periodic integrity verification.
+  Key rotation ensures cryptographic hygiene per NIST SP 800-57.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues:
+      - Production
+      - Validation
+      - Development
+    Default: Production
+    Description: Deployment environment for tagging and access control.
+
+  KeyAdminRoleArn:
+    Type: String
+    Description: ARN of the IAM role permitted to administer this key.
+    AllowedPattern: 'arn:aws:iam::[0-9]{12}:role/.+'
+
+Resources:
+  GxPKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'GxP-compliant CMK for ${Environment} environment data encryption'
+      EnableKeyRotation: true
+      MultiRegion: false
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: gxp-key-policy
+        Statement:
+          - Sid: EnableRootAccountAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+          - Sid: AllowKeyAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Ref KeyAdminRoleArn
+            Action:
+              - kms:Create*
+              - kms:Describe*
+              - kms:Enable*
+              - kms:List*
+              - kms:Put*
+              - kms:Update*
+              - kms:Revoke*
+              - kms:Disable*
+              - kms:Get*
+              - kms:Delete*
+              - kms:TagResource
+              - kms:UntagResource
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+            Resource: '*'
+
+          - Sid: AllowCloudTrailEncryption
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              StringLike:
+                kms:EncryptionContext:aws:cloudtrail:arn:
+                  - !Sub 'arn:aws:cloudtrail:*:${AWS::AccountId}:trail/*'
+
+          - Sid: AllowCloudTrailDecrypt
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              'Null':
+                kms:EncryptionContext:aws:cloudtrail:arn: 'false'
+
+          - Sid: AllowS3ServiceEncryption
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+          - Sid: AllowCloudWatchLogsEncryption
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+          - Sid: AllowSNSServiceEncryption
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+      Tags:
+        - Key: GxP-Classification
+          Value: GxP-Regulated
+        - Key: Data-Integrity
+          Value: ALCOA-Plus-Encryption-Control
+        - Key: ALCOA-Plus-Compliant
+          Value: 'true'
+        - Key: Regulatory-Reference
+          Value: 21-CFR-Part-11.10(d)
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: aws-landing-zone
+          Value: gxp-compliance-automation
+
+  GxPKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/gxp-${Environment}-cmk'
+      TargetKeyId: !Ref GxPKmsKey
+
+Outputs:
+  KeyArn:
+    Description: ARN of the GxP-compliant KMS CMK
+    Value: !GetAtt GxPKmsKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KeyArn'
+
+  KeyAlias:
+    Description: Alias of the GxP-compliant KMS CMK
+    Value: !Ref GxPKmsKeyAlias
+    Export:
+      Name: !Sub '${AWS::StackName}-KeyAlias'

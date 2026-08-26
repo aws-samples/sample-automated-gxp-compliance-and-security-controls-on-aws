@@ -1,0 +1,540 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  GxP Validation Pipeline for High-Process-Risk workloads (GAMP Category 5).
+  Implements full IQ/OQ/PQ validation lifecycle with manual QA and Release
+  approval gates. Supports 21 CFR Part 11.10(a) - validation of systems,
+  EU Annex 11 Section 4 - validation, and ISPE GAMP 5 lifecycle approach.
+
+Parameters:
+  ConnectionArn:
+    Type: String
+    Description: ARN of the CodeStar Connections connection (GitHub/GitLab).
+    AllowedPattern: 'arn:aws:codestar-connections:.+:\d{12}:connection/.+'
+
+  RepositoryId:
+    Type: String
+    Description: Repository identifier (e.g., owner/repo-name).
+
+  BranchName:
+    Type: String
+    Default: main
+    Description: Source branch to trigger the pipeline.
+
+  IQFunctionArn:
+    Type: String
+    Description: >-
+      ARN of the Lambda function that executes Installation Qualification (IQ)
+      verification against the validation environment.
+    AllowedPattern: 'arn:aws:lambda:.+:\d{12}:function:.+'
+
+  QANotificationTopicArn:
+    Type: String
+    Description: SNS topic ARN for QA approval notifications.
+    AllowedPattern: 'arn:aws:sns:.+:\d{12}:.+'
+
+  ComplianceNotificationTopicArn:
+    Type: String
+    Description: SNS topic ARN for compliance/release approval notifications.
+    AllowedPattern: 'arn:aws:sns:.+:\d{12}:.+'
+
+Resources:
+  # ===========================================================================
+  # Artifact Store
+  # ===========================================================================
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'gxp-pipeline-artifacts-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt PipelineKmsKey.Arn
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 365
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: Purpose
+          Value: Pipeline-Artifacts
+        - Key: aws-landing-zone
+          Value: gxp-compliance-automation
+
+  PipelineKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for GxP pipeline artifact encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootAccountAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowCodePipelineService
+            Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+            Resource: '*'
+          - Sid: AllowCodeBuildService
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt CodeBuildServiceRole.Arn
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:Encrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+            Resource: '*'
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: aws-landing-zone
+          Value: gxp-compliance-automation
+
+  PipelineKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/gxp-pipeline-key
+      TargetKeyId: !Ref PipelineKmsKey
+
+  # ===========================================================================
+  # IAM Roles
+  # ===========================================================================
+  PipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'gxp-pipeline-service-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub '${ArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                  - kms:Encrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                Resource: !GetAtt PipelineKmsKey.Arn
+              - Effect: Allow
+                Action:
+                  - codestar-connections:UseConnection
+                Resource: !Ref ConnectionArn
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource:
+                  - !GetAtt BuildProject.Arn
+                  - !GetAtt OQTestProject.Arn
+                  - !GetAtt PQTestProject.Arn
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Ref IQFunctionArn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref QANotificationTopicArn
+                  - !Ref ComplianceNotificationTopicArn
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: aws-landing-zone
+          Value: gxp-compliance-automation
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'gxp-codebuild-service-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub '${ArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                  - kms:Encrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                Resource: !GetAtt PipelineKmsKey.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/gxp-*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/gxp-*:*'
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: aws-landing-zone
+          Value: gxp-compliance-automation
+
+  # ===========================================================================
+  # CodeBuild Projects
+  # ===========================================================================
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: gxp-high-risk-build
+      Description: >-
+        Build and package stage for high-process-risk GxP workload.
+        Produces deployment artifacts with integrity checksums.
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      EncryptionKey: !GetAtt PipelineKmsKey.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: DATA_CLASSIFICATION
+            Value: High-Process-Risk
+          - Name: VALIDATION_LEVEL
+            Value: Full-IQ-OQ-PQ
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec.yml
+      TimeoutInMinutes: 30
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: Pipeline-Stage
+          Value: Build
+        - Key: aws-landing-zone
+          Value: gxp-compliance-automation
+
+  OQTestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: gxp-high-risk-oq-tests
+      Description: >-
+        Operational Qualification (OQ) - Functional testing to verify the system
+        operates as intended across all anticipated operating ranges per
+        21 CFR Part 11.10(a) and GAMP 5 Section 5.5.
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      EncryptionKey: !GetAtt PipelineKmsKey.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: TEST_TYPE
+            Value: operational-qualification
+          - Name: DATA_CLASSIFICATION
+            Value: High-Process-Risk
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-oq.yml
+      TimeoutInMinutes: 60
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: Pipeline-Stage
+          Value: OQ-Functional-Tests
+        - Key: aws-landing-zone
+          Value: gxp-compliance-automation
+
+  PQTestProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: gxp-high-risk-pq-tests
+      Description: >-
+        Performance Qualification (PQ) - Performance and stress testing to
+        demonstrate the system consistently performs as expected under
+        production-like conditions per GAMP 5 Section 5.6.
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      EncryptionKey: !GetAtt PipelineKmsKey.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: TEST_TYPE
+            Value: performance-qualification
+          - Name: DATA_CLASSIFICATION
+            Value: High-Process-Risk
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec-pq.yml
+      TimeoutInMinutes: 120
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: Pipeline-Stage
+          Value: PQ-Performance-Tests
+        - Key: aws-landing-zone
+          Value: gxp-compliance-automation
+
+  # ===========================================================================
+  # CodePipeline
+  # ===========================================================================
+  GxPHighRiskPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: gxp-high-process-risk-pipeline
+      RoleArn: !GetAtt PipelineServiceRole.Arn
+      PipelineType: V2
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+        EncryptionKey:
+          Id: !GetAtt PipelineKmsKey.Arn
+          Type: KMS
+      Stages:
+        # =====================================================================
+        # Stage 1: Source
+        # =====================================================================
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref ConnectionArn
+                FullRepositoryId: !Ref RepositoryId
+                BranchName: !Ref BranchName
+                DetectChanges: true
+                OutputArtifactFormat: CODE_ZIP
+              OutputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+
+        # =====================================================================
+        # Stage 2: Build
+        # =====================================================================
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref BuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+
+        # =====================================================================
+        # Stage 3: Installation Qualification (IQ)
+        # =====================================================================
+        - Name: InstallationQualification
+          Actions:
+            - Name: DeployToValidation
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: gxp-validation-environment
+                TemplatePath: BuildOutput::template-packaged.yaml
+                RoleArn: !GetAtt PipelineServiceRole.Arn
+                Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM
+              InputArtifacts:
+                - Name: BuildOutput
+              OutputArtifacts:
+                - Name: ValidationDeployOutput
+              RunOrder: 1
+            - Name: InvokeIQVerification
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: '1'
+              Configuration:
+                FunctionName: !Select
+                  - 6
+                  - !Split
+                    - ':'
+                    - !Ref IQFunctionArn
+                UserParameters: '{"stage": "IQ", "classification": "High-Process-Risk"}'
+              InputArtifacts:
+                - Name: BuildOutput
+              OutputArtifacts:
+                - Name: IQOutput
+              RunOrder: 2
+
+        # =====================================================================
+        # Stage 4: Operational Qualification (OQ)
+        # =====================================================================
+        - Name: OperationalQualification
+          Actions:
+            - Name: OQFunctionalTests
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref OQTestProject
+              InputArtifacts:
+                - Name: BuildOutput
+              OutputArtifacts:
+                - Name: OQOutput
+              RunOrder: 1
+
+        # =====================================================================
+        # Stage 5: QA Approval Gate
+        # =====================================================================
+        - Name: QAApproval
+          Actions:
+            - Name: QAReviewAndApproval
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                NotificationArn: !Ref QANotificationTopicArn
+                CustomData: >-
+                  GxP QA Approval Required: Review IQ/OQ results for high-process-risk
+                  workload. Verify all qualification protocols passed. Approval constitutes
+                  electronic signature per 21 CFR Part 11.50.
+              RunOrder: 1
+
+        # =====================================================================
+        # Stage 6: Performance Qualification (PQ)
+        # =====================================================================
+        - Name: PerformanceQualification
+          Actions:
+            - Name: PQPerformanceTests
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref PQTestProject
+              InputArtifacts:
+                - Name: BuildOutput
+              OutputArtifacts:
+                - Name: PQOutput
+              RunOrder: 1
+
+        # =====================================================================
+        # Stage 7: Release Approval Gate
+        # =====================================================================
+        - Name: ReleaseApproval
+          Actions:
+            - Name: ComplianceReleaseApproval
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                NotificationArn: !Ref ComplianceNotificationTopicArn
+                CustomData: >-
+                  GxP Release Approval Required: Full IQ/OQ/PQ validation complete.
+                  Review PQ results and approve production deployment. This approval
+                  constitutes release authorization per 21 CFR Part 11.10(a) and
+                  EU Annex 11 Section 4. Electronic signature binding applies.
+              RunOrder: 1
+
+        # =====================================================================
+        # Stage 8: Production Deploy
+        # =====================================================================
+        - Name: ProductionDeploy
+          Actions:
+            - Name: DeployToProduction
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CREATE_UPDATE
+                StackName: gxp-production-workload
+                TemplatePath: BuildOutput::template-packaged.yaml
+                RoleArn: !GetAtt PipelineServiceRole.Arn
+                Capabilities: CAPABILITY_IAM,CAPABILITY_NAMED_IAM
+                ParameterOverrides: '{"Environment": "Production"}'
+              InputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: ALCOA-Plus-Compliant
+          Value: 'true'
+        - Key: Validation-Lifecycle
+          Value: Full-IQ-OQ-PQ
+        - Key: Regulatory-Reference
+          Value: 21-CFR-Part-11.10(a)-EU-Annex-11-Sec-4
+        - Key: aws-landing-zone
+          Value: gxp-compliance-automation

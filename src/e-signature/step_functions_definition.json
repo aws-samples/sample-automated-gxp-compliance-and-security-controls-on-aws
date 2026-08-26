@@ -1,0 +1,163 @@
+{
+  "Comment": "21 CFR Part 11.50 E-Signature Workflow - Implements compliant electronic signature capture with re-authentication, signature record creation, and notification. Ensures signatures are executed by the signer at signing time (11.50) and cryptographically linked to their records (11.70).",
+  "StartAt": "RequestSignature",
+  "States": {
+    "RequestSignature": {
+      "Type": "Pass",
+      "Comment": "Receive and validate the signing request containing record_id, signer credentials, and signature meaning per 11.50(a)(3)",
+      "Parameters": {
+        "username.$": "$.username",
+        "password.$": "$.password",
+        "record_id.$": "$.record_id",
+        "signature_meaning.$": "$.signature_meaning"
+      },
+      "Next": "ReAuthenticate"
+    },
+    "ReAuthenticate": {
+      "Type": "Task",
+      "Comment": "Re-authenticate the signer at signing time per 11.50 and 11.100(a). Verifies identity via Cognito USER_PASSWORD_AUTH flow.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ReAuthLambdaArn}",
+        "Payload.$": "$"
+      },
+      "ResultPath": "$.authResult",
+      "ResultSelector": {
+        "statusCode.$": "$.Payload.statusCode",
+        "authenticated.$": "$.Payload.authenticated",
+        "username.$": "$.Payload.username",
+        "record_id.$": "$.Payload.record_id",
+        "signature_meaning.$": "$.Payload.signature_meaning",
+        "error.$": "$.Payload.error"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.errorInfo",
+          "Next": "AuthFailed"
+        }
+      ],
+      "Next": "CheckAuthResult"
+    },
+    "CheckAuthResult": {
+      "Type": "Choice",
+      "Comment": "Evaluate re-authentication result. If authentication failed, route to AuthFailed state per 11.50 requirement.",
+      "Choices": [
+        {
+          "Variable": "$.authResult.authenticated",
+          "BooleanEquals": false,
+          "Next": "AuthFailed"
+        },
+        {
+          "Variable": "$.authResult.authenticated",
+          "BooleanEquals": true,
+          "Next": "CreateSignatureRecord"
+        }
+      ],
+      "Default": "AuthFailed"
+    },
+    "AuthFailed": {
+      "Type": "Fail",
+      "Comment": "Re-authentication failed - signature cannot be executed without verified identity per 11.50 and 11.100(a)",
+      "Cause": "Re-authentication failed. The signer's identity could not be verified at the time of signing as required by 21 CFR Part 11.50.",
+      "Error": "ReAuthenticationFailed"
+    },
+    "CreateSignatureRecord": {
+      "Type": "Task",
+      "Comment": "Create the Part 11.50-compliant signature record with printed name (a)(1), date/time (a)(2), meaning (a)(3), and cryptographic record binding per 11.70",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${SignatureRecordLambdaArn}",
+        "Payload": {
+          "username.$": "$.authResult.username",
+          "record_id.$": "$.authResult.record_id",
+          "signature_meaning.$": "$.authResult.signature_meaning"
+        }
+      },
+      "ResultPath": "$.signatureResult",
+      "ResultSelector": {
+        "statusCode.$": "$.Payload.statusCode",
+        "signature_record.$": "$.Payload.signature_record"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.errorInfo",
+          "Next": "SignatureCreationFailed"
+        }
+      ],
+      "Next": "NotifySigner"
+    },
+    "NotifySigner": {
+      "Type": "Task",
+      "Comment": "Send SNS notification confirming signature was successfully captured with all Part 11.50 required elements",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${SignatureNotificationTopicArn}",
+        "Subject": "Electronic Signature Captured - 21 CFR Part 11 Compliant",
+        "Message.$": "States.Format('Signature captured successfully.\n\nRecord ID: {}\nSigner: {}\nMeaning: {}\nTimestamp: {}\nSignature ID: {}', $.signatureResult.signature_record.record_id, $.signatureResult.signature_record.printed_name, $.signatureResult.signature_record.meaning, $.signatureResult.signature_record.date_time, $.signatureResult.signature_record.signature_id)"
+      },
+      "ResultPath": "$.notificationResult",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.notificationError",
+          "Next": "SignatureComplete"
+        }
+      ],
+      "Next": "SignatureComplete"
+    },
+    "SignatureComplete": {
+      "Type": "Succeed",
+      "Comment": "Signature workflow completed successfully. Output contains the full Part 11.50-compliant signature record with 11.70 cryptographic linking."
+    },
+    "SignatureCreationFailed": {
+      "Type": "Fail",
+      "Comment": "Signature record creation failed after successful authentication",
+      "Cause": "Failed to create the electronic signature record in DynamoDB after successful re-authentication.",
+      "Error": "SignatureRecordCreationFailed"
+    }
+  }
+}

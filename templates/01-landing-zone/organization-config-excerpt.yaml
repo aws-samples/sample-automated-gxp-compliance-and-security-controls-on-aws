@@ -1,0 +1,45 @@
+# ==============================================================================
+# EXCERPT: Landing Zone Accelerator (LZA) organization-config.yaml
+# ==============================================================================
+# This is NOT a standalone deployable file. It is an excerpt showing how to
+# reference the GxP SCP preventive controls within the LZA organization-config.
+# Integrate these sections into your full organization-config.yaml.
+# ==============================================================================
+#
+# For complete LZA configuration reference, see:
+# https://awslabs.github.io/landing-zone-accelerator-on-aws/
+# ==============================================================================
+
+# --- Service Control Policies Section ---
+serviceControlPolicies:
+  - name: GxP-Preventive-Controls
+    description: >-
+      Preventive SCP controls for GxP-regulated workloads. Prevents modification
+      of audit trails (CloudTrail), encryption keys (KMS), storage public access
+      (S3), and configuration recording (AWS Config). Supports compliance with
+      21 CFR Part 11.10(e) - audit trail protection and EU Annex 11 Section 9.
+    policy: gxp-scp-preventive-controls.json
+    type: customerManaged
+    deploymentTargets:
+      organizationalUnits:
+        - GxP-Production
+        - GxP-Validation
+        # Apply to all OUs containing GxP-regulated workloads
+        # Do NOT apply to the Management account OU
+
+# --- Organizational Units Section (for context) ---
+organizationalUnits:
+  - name: Security
+    # LZA-managed security OU
+  - name: Infrastructure
+    # Shared infrastructure OU
+  - name: GxP-Production
+    # Production workloads subject to GxP regulations
+    # SCP: GxP-Preventive-Controls applied here
+  - name: GxP-Validation
+    # Validation/qualification environments (IQ/OQ/PQ)
+    # SCP: GxP-Preventive-Controls applied here
+  - name: GxP-Development
+    # Development environments - less restrictive SCPs
+  - name: Sandbox
+    # Non-regulated sandbox accounts

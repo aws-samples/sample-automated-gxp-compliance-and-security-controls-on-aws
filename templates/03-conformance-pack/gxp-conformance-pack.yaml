@@ -1,0 +1,181 @@
+################################################################################
+# GxP Conformance Pack
+# AWS Config Conformance Pack for GxP-regulated environments
+#
+# Regulatory Coverage:
+#   - FDA 21 CFR Part 11 (Electronic Records; Electronic Signatures)
+#   - EU Annex 11 (Computerised Systems)
+#   - ISPE GAMP 5 (Good Automated Manufacturing Practice)
+#   - ICH Q7 (Good Manufacturing Practice for Active Pharmaceutical Ingredients)
+#
+# Each rule maps to specific regulatory requirements to support qualification
+# and validation documentation (IQ/OQ/PQ).
+################################################################################
+
+Parameters:
+  IamPasswordMinLength:
+    Type: String
+    Default: "14"
+  IamPasswordMaxAge:
+    Type: String
+    Default: "90"
+  IamPasswordReusePrevention:
+    Type: String
+    Default: "24"
+
+Resources:
+  # ===========================================================================
+  # CloudTrail Controls - Audit Trail Integrity
+  # ===========================================================================
+  CloudTrailEnabled:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: gxp-cloud-trail-enabled
+      Description: >-
+        [21 CFR Part 11.10(e)] Ensures CloudTrail is enabled to maintain secure,
+        computer-generated, time-stamped audit trails that independently record
+        the date and time of operator entries and actions.
+        [EU Annex 11 Section 9] Audit trails of all GxP-relevant changes.
+      Source:
+        Owner: AWS
+        SourceIdentifier: CLOUD_TRAIL_ENABLED
+      MaximumExecutionFrequency: TwentyFour_Hours
+
+  CloudTrailLogFileValidationEnabled:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: gxp-cloud-trail-log-file-validation
+      Description: >-
+        [21 CFR Part 11.10(e)] Ensures CloudTrail log file integrity validation
+        is enabled to detect tampering, ensuring audit trail records cannot be
+        altered without detection. Supports data integrity per ALCOA+ principles.
+        [EU Annex 11 Section 9] Protection against unauthorized changes to records.
+      Source:
+        Owner: AWS
+        SourceIdentifier: CLOUD_TRAIL_LOG_FILE_VALIDATION_ENABLED
+      MaximumExecutionFrequency: TwentyFour_Hours
+
+  CloudTrailEncryptionEnabled:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: gxp-cloud-trail-encryption-enabled
+      Description: >-
+        [21 CFR Part 11.10(d)] Ensures CloudTrail logs are encrypted at rest
+        using KMS, limiting system access to authorized individuals and protecting
+        audit records from unauthorized disclosure.
+        [EU Annex 11 Section 7.1] Data storage shall provide protection against damage.
+      Source:
+        Owner: AWS
+        SourceIdentifier: CLOUD_TRAIL_ENCRYPTION_ENABLED
+      MaximumExecutionFrequency: TwentyFour_Hours
+
+  # ===========================================================================
+  # S3 Storage Controls - Data Integrity and Protection
+  # ===========================================================================
+  S3BucketServerSideEncryptionEnabled:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: gxp-s3-bucket-encryption-enabled
+      Description: >-
+        [21 CFR Part 11.10(d)] Ensures S3 buckets have server-side encryption
+        enabled to protect electronic records from unauthorized access at rest.
+        [EU Annex 11 Section 7.1] Data shall be secured by physical and electronic
+        means against damage, with checks for data integrity and accessibility.
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED
+
+  S3BucketVersioningEnabled:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: gxp-s3-bucket-versioning-enabled
+      Description: >-
+        [21 CFR Part 11.10(e)] Ensures S3 versioning preserves all prior versions
+        of electronic records, supporting audit trail completeness and the ability
+        to reconstruct data processing history.
+        [EU Annex 11 Section 9] All changes to data should be recorded with the
+        previous values retained. ALCOA+ Original - data preserved as first recorded.
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_VERSIONING_ENABLED
+
+  # ===========================================================================
+  # IAM Controls - Access Control and Authentication
+  # ===========================================================================
+  IamPasswordPolicy:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: gxp-iam-password-policy
+      Description: >-
+        [21 CFR Part 11.10(d)] Ensures IAM password policy enforces strong
+        authentication controls to limit system access to authorized individuals.
+        [21 CFR Part 11.300] Electronic signatures must be unique and non-reusable.
+        [EU Annex 11 Section 12] Security measures for personnel authorization.
+      InputParameters:
+        MinimumPasswordLength:
+          Ref: IamPasswordMinLength
+        RequireUppercaseCharacters: true
+        RequireLowercaseCharacters: true
+        RequireNumbers: true
+        RequireSymbols: true
+        PasswordReusePrevention:
+          Ref: IamPasswordReusePrevention
+        MaxPasswordAge:
+          Ref: IamPasswordMaxAge
+      Source:
+        Owner: AWS
+        SourceIdentifier: IAM_PASSWORD_POLICY
+      MaximumExecutionFrequency: TwentyFour_Hours
+
+  # ===========================================================================
+  # RDS Controls - Database Encryption
+  # ===========================================================================
+  RdsStorageEncrypted:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: gxp-rds-storage-encrypted
+      Description: >-
+        [21 CFR Part 11.10(d)] Ensures RDS instances have storage encryption
+        enabled to protect electronic records and databases containing GxP data
+        from unauthorized physical access.
+        [EU Annex 11 Section 7.1] Data storage protection against damage and
+        unauthorized access. Critical for databases storing batch records,
+        laboratory data, and manufacturing execution system (MES) data.
+      Source:
+        Owner: AWS
+        SourceIdentifier: RDS_STORAGE_ENCRYPTED
+
+  # ===========================================================================
+  # KMS Controls - Encryption Key Management
+  # ===========================================================================
+  CmkBackingKeyRotationEnabled:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: gxp-cmk-backing-key-rotation-enabled
+      Description: >-
+        [21 CFR Part 11.10(d)] Ensures KMS CMK automatic key rotation is enabled
+        to maintain cryptographic hygiene and limit exposure from key compromise.
+        Supports NIST SP 800-57 key management lifecycle and ensures ongoing
+        protection of encrypted GxP records.
+        [EU Annex 11 Section 7.1] Periodic verification of data accessibility.
+      Source:
+        Owner: AWS
+        SourceIdentifier: CMK_BACKING_KEY_ROTATION_ENABLED
+      MaximumExecutionFrequency: TwentyFour_Hours
+
+  # ===========================================================================
+  # Network Controls - Network Monitoring
+  # ===========================================================================
+  VpcFlowLogsEnabled:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: gxp-vpc-flow-logs-enabled
+      Description: >-
+        [21 CFR Part 11.10(e)] Ensures VPC Flow Logs are enabled to maintain
+        network-level audit trails of all communication to and from GxP systems.
+        Supports detection of unauthorized access attempts and forensic analysis.
+        [EU Annex 11 Section 12.4] Recording unauthorized access attempts.
+        [ICH Q7 Section 5.4] Systems should have appropriate audit trails.
+      Source:
+        Owner: AWS
+        SourceIdentifier: VPC_FLOW_LOGS_ENABLED
