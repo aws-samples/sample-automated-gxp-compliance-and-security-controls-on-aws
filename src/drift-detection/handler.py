@@ -2,7 +2,8 @@
 GxP Compliance Drift Detection Lambda Handler.
 
 Triggered by EventBridge rule on AWS Config compliance change events.
-Detects NON_COMPLIANT evaluations, publishes alerts to SNS, and checks
+Detects NON_COMPLIANT evaluations, publishes findings to AWS Security Hub
+(primary, for auditable record) and SNS (secondary, for alerting), and checks
 if the affected resource is tagged as high-process-risk for critical alerting.
 
 Python 3.12 | AWS Lambda Runtime
@@ -24,10 +25,12 @@ logger.setLevel(logging.INFO)
 # Environment variables
 ALERT_TOPIC_ARN: str = os.environ.get("ALERT_TOPIC_ARN", "")
 CRITICAL_TOPIC_ARN: str = os.environ.get("CRITICAL_TOPIC_ARN", "")
+SECURITY_HUB_ENABLED: str = os.environ.get("SECURITY_HUB_ENABLED", "true")
 
 # AWS clients (initialized outside handler for connection reuse)
 sns_client = boto3.client("sns")
 config_client = boto3.client("config")
+securityhub_client = boto3.client("securityhub")
 
 
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
@@ -83,6 +86,15 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
             message=alert_payload,
         )
 
+        # Publish to Security Hub as a custom finding (auditable, queryable record)
+        if SECURITY_HUB_ENABLED.lower() == "true":
+            _publish_to_security_hub(
+                compliance_details=compliance_details,
+                alert_payload=alert_payload,
+                event=event,
+                severity_label="HIGH",
+            )
+
         # Check if resource is high-process-risk
         is_critical = _check_high_process_risk(
             resource_type=compliance_details["resource_type"],
@@ -101,6 +113,13 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
                 subject=f"CRITICAL GxP Drift: {compliance_details['config_rule_name']}",
                 message=alert_payload,
             )
+            if SECURITY_HUB_ENABLED.lower() == "true":
+                _publish_to_security_hub(
+                    compliance_details=compliance_details,
+                    alert_payload=alert_payload,
+                    event=event,
+                    severity_label="CRITICAL",
+                )
 
         # Return details for Step Functions integration
         return {
@@ -231,6 +250,97 @@ def _publish_to_sns(
         "Alert published to SNS",
         extra={"topic_arn": topic_arn, "subject": subject},
     )
+
+
+def _publish_to_security_hub(
+    compliance_details: dict[str, str],
+    alert_payload: dict[str, Any],
+    event: dict[str, Any],
+    severity_label: str = "HIGH",
+) -> None:
+    """
+    Publish a GxP compliance drift event to AWS Security Hub as a custom finding.
+
+    Security Hub provides a structured, queryable audit trail that satisfies
+    GxP change control requirements better than email or SNS alone. Findings
+    are retained in Security Hub and can be queried for periodic review evidence.
+
+    Args:
+        compliance_details: Extracted compliance information.
+        alert_payload: The structured alert payload from _build_alert_payload.
+        event: Original EventBridge event for account/region metadata.
+        severity_label: ASFF severity label ("INFORMATIONAL", "LOW", "MEDIUM",
+                        "HIGH", or "CRITICAL").
+
+    Raises:
+        ClientError: If Security Hub batch_import_findings fails.
+    """
+    account_id = alert_payload.get("account_id", "unknown")
+    region = alert_payload.get("region", "unknown")
+    resource_type = compliance_details["resource_type"]
+    resource_id = compliance_details["resource_id"]
+    config_rule_name = compliance_details["config_rule_name"]
+    timestamp = alert_payload.get("timestamp", datetime.now(timezone.utc).isoformat())
+
+    # Unique finding ID: account/region/rule/resource
+    finding_id = (
+        f"gxp-drift/{account_id}/{region}/{config_rule_name}/{resource_id}"
+    )
+    product_arn = f"arn:aws:securityhub:{region}:{account_id}:product/{account_id}/default"
+
+    severity_map = {
+        "INFORMATIONAL": 0, "LOW": 39, "MEDIUM": 69, "HIGH": 89, "CRITICAL": 100
+    }
+
+    finding = {
+        "SchemaVersion": "2018-10-08",
+        "Id": finding_id,
+        "ProductArn": product_arn,
+        "GeneratorId": "gxp-compliance-drift-detection",
+        "AwsAccountId": account_id,
+        "Types": ["Software and Configuration Checks/GxP Compliance/Drift Detection"],
+        "CreatedAt": timestamp,
+        "UpdatedAt": timestamp,
+        "Severity": {
+            "Label": severity_label,
+            "Normalized": severity_map.get(severity_label, 89),
+        },
+        "Title": f"GxP compliance drift: {config_rule_name}",
+        "Description": (
+            f"Resource {resource_id} ({resource_type}) is NON_COMPLIANT with "
+            f"Config rule {config_rule_name}. This drift may affect the validated "
+            f"state of the GxP system. Assess whether this change was intentional "
+            f"(requiring retroactive change control documentation) or unintentional "
+            f"(requiring remediation)."
+        ),
+        "Resources": [
+            {
+                "Type": resource_type,
+                "Id": resource_id,
+                "Region": region,
+            }
+        ],
+        "Compliance": {"Status": "FAILED"},
+        "Note": {
+            "Text": f"Config rule: {config_rule_name}. Source: gxp-drift-detection.",
+            "UpdatedBy": "gxp-compliance-drift-detection",
+            "UpdatedAt": timestamp,
+        },
+    }
+
+    try:
+        securityhub_client.batch_import_findings(Findings=[finding])
+        logger.info(
+            "Drift finding published to Security Hub",
+            extra={"finding_id": finding_id, "severity": severity_label},
+        )
+    except ClientError as e:
+        # Log but do not raise: SNS already fired; Security Hub failure
+        # should not block the Step Functions return value.
+        logger.error(
+            "Failed to publish finding to Security Hub",
+            extra={"error": str(e), "finding_id": finding_id},
+        )
 
 
 def _check_high_process_risk(resource_type: str, resource_id: str) -> bool:
