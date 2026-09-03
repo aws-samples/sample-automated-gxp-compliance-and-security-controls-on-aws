@@ -37,7 +37,7 @@ The solution accelerates time-to-compliance by replacing manual, paper-based val
 
 4. **E-Signature Workflow** — A 21 CFR Part 11-compliant electronic signature system using Amazon Cognito for identity, AWS Step Functions for workflow orchestration, and DynamoDB for tamper-evident audit trails.
 
-5. **Continuous Monitoring** — Ongoing compliance verification through AWS Config conformance packs, Security Hub findings, and CloudWatch alarms that detect drift from the validated state.
+5. **Continuous Monitoring** — Ongoing compliance verification through AWS Config conformance packs and CloudWatch alarms. A drift detection Lambda processes Config compliance change events and publishes findings to AWS Security Hub (primary, auditable record), with Amazon SNS as a secondary alerting channel, so departures from the validated state are recorded and reviewable.
 
 ---
 
@@ -95,7 +95,7 @@ aws cloudformation deploy \
 ```bash
 aws configservice put-conformance-pack \
   --conformance-pack-name GxP-Compliance-Pack \
-  --template-body file://templates/03-continuous-monitoring/gxp-conformance-pack.yaml \
+  --template-body file://templates/03-conformance-pack/gxp-conformance-pack.yaml \
   --delivery-s3-bucket $(aws cloudformation describe-stacks \
     --stack-name gxp-compliant-storage \
     --query 'Stacks[0].Outputs[?OutputKey==`ConfigBucketName`].OutputValue' \
@@ -122,7 +122,7 @@ aws cloudformation deploy \
 ### Step 5: Package and Deploy IQ Verification Lambda
 
 ```bash
-cd src/iq-verification-lambda
+cd src/iq-verification
 
 # Install dependencies
 pip install -r requirements.txt -t ./package
@@ -166,6 +166,38 @@ aws cloudformation deploy \
         --query 'Stacks[0].Outputs[?OutputKey==`ArtifactBucketName`].OutputValue' \
         --output text) \
       ApprovalNotificationTopic=arn:aws:sns:us-east-1:ACCOUNT_ID:gxp-approvals \
+  --capabilities CAPABILITY_NAMED_IAM
+```
+
+### Step 7: Package and Deploy Drift Detection Stack
+
+The drift detection Lambda processes AWS Config compliance change events. On a
+NON_COMPLIANT evaluation it publishes a custom finding to AWS Security Hub
+(primary, auditable record) and an alert to Amazon SNS (secondary), escalating
+high-process-risk resources to a separate critical topic.
+
+Prerequisites: AWS Security Hub must be enabled in the deployment account and
+Region. If Security Hub is not enabled, set `SecurityHubEnabled=false` to route
+alerts to SNS only.
+
+```bash
+# Package the Lambda and upload it to the artifact bucket
+make package
+aws s3 cp dist/drift-detection.zip s3://$(aws cloudformation describe-stacks \
+  --stack-name gxp-compliant-storage \
+  --query 'Stacks[0].Outputs[?OutputKey==`ArtifactBucketName`].OutputValue' \
+  --output text)/drift-detection/handler.zip
+
+aws cloudformation deploy \
+  --template-file templates/06-drift-detection/gxp-drift-detection.yaml \
+  --stack-name gxp-drift-detection \
+  --parameter-overrides \
+      Environment=prod \
+      LambdaCodeBucket=$(aws cloudformation describe-stacks \
+        --stack-name gxp-compliant-storage \
+        --query 'Stacks[0].Outputs[?OutputKey==`ArtifactBucketName`].OutputValue' \
+        --output text) \
+      SecurityHubEnabled=true \
   --capabilities CAPABILITY_NAMED_IAM
 ```
 
@@ -213,28 +245,32 @@ aws configservice get-conformance-pack-compliance-summary \
 Delete stacks in **reverse order** to avoid dependency errors:
 
 ```bash
-# 1. Delete validation pipeline
+# 1. Delete drift detection stack
+aws cloudformation delete-stack --stack-name gxp-drift-detection
+aws cloudformation wait stack-delete-complete --stack-name gxp-drift-detection
+
+# 2. Delete validation pipeline
 aws cloudformation delete-stack --stack-name gxp-validation-pipeline
 aws cloudformation wait stack-delete-complete --stack-name gxp-validation-pipeline
 
-# 2. Delete IQ verification Lambda
+# 3. Delete IQ verification Lambda
 aws cloudformation delete-stack --stack-name gxp-iq-verification
 aws cloudformation wait stack-delete-complete --stack-name gxp-iq-verification
 
-# 3. Delete e-signature stack
+# 4. Delete e-signature stack
 aws cloudformation delete-stack --stack-name gxp-e-signature
 aws cloudformation wait stack-delete-complete --stack-name gxp-e-signature
 
-# 4. Delete conformance pack
+# 5. Delete conformance pack
 aws configservice delete-conformance-pack \
   --conformance-pack-name GxP-Compliance-Pack
 
-# 5. Delete compliant storage (NOTE: empty buckets first)
+# 6. Delete compliant storage (NOTE: empty buckets first)
 aws s3 rm s3://BUCKET_NAME --recursive  # Repeat for each bucket
 aws cloudformation delete-stack --stack-name gxp-compliant-storage
 aws cloudformation wait stack-delete-complete --stack-name gxp-compliant-storage
 
-# 6. Delete KMS key (scheduled for deletion)
+# 7. Delete KMS key (scheduled for deletion)
 aws cloudformation delete-stack --stack-name gxp-kms-key
 aws cloudformation wait stack-delete-complete --stack-name gxp-kms-key
 ```
@@ -257,59 +293,56 @@ The blog post provides context on the regulatory landscape, design decisions, an
 
 ```
 gxp-compliance-automation/
-├── README.md
-├── CONTRIBUTING.md
-├── LICENSE
 ├── docs/
+│   ├── architecture.drawio
 │   ├── architecture.png
 │   ├── system-boundary-template.md
 │   └── validation-artifact-mapping.md
+├── src/
+│   ├── drift-detection/
+│   │   ├── handler.py
+│   │   └── requirements.txt
+│   ├── e-signature/
+│   │   ├── reauth_lambda.py
+│   │   ├── requirements.txt
+│   │   ├── signature_record_lambda.py
+│   │   └── step_functions_definition.json
+│   ├── iq-verification/
+│   │   ├── checks/
+│   │   │   ├── __init__.py
+│   │   │   ├── encryption_access.py
+│   │   │   ├── iam_trust.py
+│   │   │   ├── integration_endpoints.py
+│   │   │   └── network_connectivity.py
+│   │   ├── handler.py
+│   │   └── requirements.txt
+│   └── rtm-generator/
+│       ├── generate_rtm.py
+│       └── requirements.txt
 ├── templates/
 │   ├── 01-landing-zone/
-│   │   ├── gxp-org-trail.yaml
-│   │   ├── gxp-scps.yaml
-│   │   └── gxp-guardrails.yaml
+│   │   ├── gxp-scp-preventive-controls.json
+│   │   └── organization-config-excerpt.yaml
 │   ├── 02-building-blocks/
-│   │   ├── gxp-kms-key.yaml
 │   │   ├── gxp-compliant-storage.yaml
-│   │   └── gxp-vpc.yaml
-│   ├── 03-continuous-monitoring/
-│   │   ├── gxp-conformance-pack.yaml
-│   │   ├── gxp-security-hub.yaml
-│   │   └── gxp-cloudwatch-alarms.yaml
+│   │   └── gxp-kms-key.yaml
+│   ├── 03-conformance-pack/
+│   │   └── gxp-conformance-pack.yaml
 │   ├── 04-validation-pipeline/
-│   │   ├── pipeline-high-risk.yaml
-│   │   ├── pipeline-medium-risk.yaml
-│   │   └── pipeline-low-risk.yaml
-│   └── 05-e-signature/
-│       ├── e-signature-stack.yaml
-│       └── cognito-user-pool.yaml
-├── src/
-│   ├── iq-verification-lambda/
-│   │   ├── handler.py
-│   │   ├── requirements.txt
-│   │   └── template.yaml
-│   ├── config-rules/
-│   │   └── custom-rules/
-│   └── e-signature/
-│       ├── sign_document.py
-│       ├── verify_signature.py
-│       └── audit_logger.py
+│   │   └── pipeline-high-risk.yaml
+│   ├── 05-e-signature/
+│   │   └── e-signature-stack.yaml
+│   └── 06-drift-detection/
+│       └── gxp-drift-detection.yaml
 ├── tests/
-│   ├── unit/
-│   │   ├── test_iq_verification.py
-│   │   ├── test_e_signature.py
-│   │   └── test_config_rules.py
-│   └── integration/
-│       ├── test_pipeline_execution.py
-│       ├── test_e_signature_workflow.py
-│       └── test_conformance_pack.py
-├── examples/
-│   ├── sample-validation-plan.md
-│   ├── sample-iq-report.json
-│   └── sample-rtm.json
-├── requirements.txt
-└── requirements-dev.txt
+│   ├── conftest.py
+│   ├── test_drift_detection.py
+│   ├── test_e_signature.py
+│   └── test_iq_verification.py
+├── CONTRIBUTING.md
+├── LICENSE
+├── Makefile
+└── README.md
 ```
 
 ---
