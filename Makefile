@@ -1,51 +1,92 @@
 # GxP Compliance Automation - Makefile
 # Automates deployment, testing, linting, and packaging for the
 # 21 CFR Part 11 / EU Annex 11 compliance infrastructure.
+#
+# Stacks are declared as "stack-name:template-path" pairs so each logical
+# stack maps to its real template file (templates live in numbered
+# subdirectories, not at the top level of templates/).
 
-# Stack names in deployment order (dependencies first)
-STACKS = gxp-foundation gxp-audit-trail gxp-drift-detection gxp-iq-verification gxp-e-signature
-# Reverse order for clean (tear down dependents first)
-STACKS_REVERSE = gxp-e-signature gxp-iq-verification gxp-drift-detection gxp-audit-trail gxp-foundation
+# Deployable stacks in dependency order (dependencies first).
+# Format: <stack-name>:<template-path>
+STACKS = \
+	gxp-kms-key:templates/02-building-blocks/gxp-kms-key.yaml \
+	gxp-compliant-storage:templates/02-building-blocks/gxp-compliant-storage.yaml \
+	gxp-conformance-pack:templates/03-conformance-pack/gxp-conformance-pack.yaml \
+	gxp-drift-detection:templates/06-drift-detection/gxp-drift-detection.yaml \
+	gxp-e-signature:templates/05-e-signature/e-signature-stack.yaml \
+	gxp-validation-pipeline:templates/04-validation-pipeline/pipeline-high-risk.yaml
+
+# Reverse order for clean (tear down dependents first).
+STACKS_REVERSE = \
+	gxp-validation-pipeline:templates/04-validation-pipeline/pipeline-high-risk.yaml \
+	gxp-e-signature:templates/05-e-signature/e-signature-stack.yaml \
+	gxp-drift-detection:templates/06-drift-detection/gxp-drift-detection.yaml \
+	gxp-conformance-pack:templates/03-conformance-pack/gxp-conformance-pack.yaml \
+	gxp-compliant-storage:templates/02-building-blocks/gxp-compliant-storage.yaml \
+	gxp-kms-key:templates/02-building-blocks/gxp-kms-key.yaml
+
+# NOTE: The landing-zone artifacts are intentionally excluded from deploy/clean:
+#   templates/01-landing-zone/gxp-scp-preventive-controls.json  (applied via
+#     AWS Organizations as a Service Control Policy, not a CloudFormation stack)
+#   templates/01-landing-zone/organization-config-excerpt.yaml  (a Landing Zone
+#     Accelerator excerpt for reference, not a standalone deployable template)
 
 # AWS region for deployment
 REGION ?= us-east-1
 # S3 bucket for Lambda packages
 PACKAGE_BUCKET ?= gxp-compliance-artifacts-$(shell aws sts get-caller-identity --query Account --output text)
 
-# Lambda source directories
-LAMBDA_DIRS = src/drift-detection src/iq-verification src/e-signature src/audit-trail
+# Lambda source directories (each contains a handler and optional requirements.txt)
+LAMBDA_DIRS = src/drift-detection src/iq-verification src/e-signature src/rtm-generator
+
+# Stacks that package Lambda code and therefore need the LambdaCodeBucket
+# parameter passed at deploy time (see the deploy target).
+LAMBDA_STACKS = gxp-drift-detection gxp-e-signature
 
 .PHONY: deploy test lint clean package help
 
 ## deploy: Deploy all CloudFormation stacks in dependency order.
 ## Each stack is deployed with --no-fail-on-empty-changeset to support idempotent runs.
+## Lambda-backed stacks additionally receive the LambdaCodeBucket parameter.
 deploy:
 	@echo "=== Deploying GxP Compliance Stacks ==="
-	@for stack in $(STACKS); do \
-		echo "Deploying $$stack..."; \
+	@for entry in $(STACKS); do \
+		stack=$${entry%%:*}; \
+		template=$${entry#*:}; \
+		echo "Deploying $$stack ($$template)..."; \
+		param_overrides=""; \
+		case " $(LAMBDA_STACKS) " in \
+			*" $$stack "*) param_overrides="--parameter-overrides LambdaCodeBucket=$(PACKAGE_BUCKET)";; \
+		esac; \
 		aws cloudformation deploy \
-			--template-file templates/$$stack.yaml \
+			--template-file $$template \
 			--stack-name $$stack \
 			--capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
 			--region $(REGION) \
 			--no-fail-on-empty-changeset \
+			$$param_overrides \
 			--tags gxp:managed-by=automation gxp:environment=production; \
 		echo "$$stack deployed successfully."; \
 	done
 	@echo "=== All stacks deployed ==="
 
-## test: Run the full pytest test suite with verbose output and coverage report.
+## test: Run the full pytest test suite with verbose output.
 ## Tests use mocked AWS services (no real AWS credentials required).
 test:
 	@echo "=== Running GxP Compliance Tests ==="
 	python -m pytest tests/ -v --tb=short --strict-markers
 	@echo "=== Tests Complete ==="
 
-## lint: Run cfn-lint on all CloudFormation templates and flake8 on Python source.
-## Ensures IaC templates are valid and Python code follows style guidelines.
+## lint: Run cfn-lint on all deployable CloudFormation templates and flake8 on Python source.
+## Only the deployable stack templates are linted (the landing-zone SCP JSON and LZA
+## excerpt are not standalone CloudFormation templates and are skipped).
 lint:
 	@echo "=== Linting CloudFormation Templates ==="
-	cfn-lint templates/*.yaml
+	@for entry in $(STACKS); do \
+		template=$${entry#*:}; \
+		echo "Linting $$template..."; \
+		cfn-lint $$template; \
+	done
 	@echo "=== Linting Python Source ==="
 	flake8 src/ tests/ --max-line-length=120 --extend-ignore=E203,W503
 	@echo "=== Lint Complete ==="
@@ -54,7 +95,8 @@ lint:
 ## WARNING: This destroys all deployed resources. Use with caution.
 clean:
 	@echo "=== Cleaning Up GxP Compliance Stacks ==="
-	@for stack in $(STACKS_REVERSE); do \
+	@for entry in $(STACKS_REVERSE); do \
+		stack=$${entry%%:*}; \
 		echo "Deleting $$stack..."; \
 		aws cloudformation delete-stack \
 			--stack-name $$stack \
