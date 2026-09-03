@@ -1,0 +1,241 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  GxP Compliance Drift Detection Stack.
+  Deploys a Lambda function triggered by AWS Config compliance change events.
+  On NON_COMPLIANT evaluations, the function publishes a custom finding to
+  AWS Security Hub (primary, auditable record) and an alert to Amazon SNS
+  (secondary, notification), and escalates high-process-risk resources to a
+  separate critical SNS topic. Supports EU GMP Annex 11 clause 11 periodic
+  review and 21 CFR Part 11 change control by producing a queryable audit
+  trail of drift events.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket containing Lambda deployment packages
+
+  DriftDetectionLambdaKey:
+    Type: String
+    Default: drift-detection/handler.zip
+    Description: S3 key for the drift-detection Lambda package
+
+  SecurityHubEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >
+      Whether to publish drift findings to AWS Security Hub. Set to 'false'
+      only if Security Hub is not enabled in this account and Region.
+
+  AlertNotificationEmail:
+    Type: String
+    Default: ''
+    Description: Email address for standard drift alert subscription (optional)
+
+  CriticalNotificationEmail:
+    Type: String
+    Default: ''
+    Description: Email address for critical (high-process-risk) drift alert subscription (optional)
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertNotificationEmail, '']]
+  HasCriticalEmail: !Not [!Equals [!Ref CriticalNotificationEmail, '']]
+
+Resources:
+  # =============================================================================
+  # SNS - Drift Alert Topics (secondary notification channel)
+  # =============================================================================
+  DriftAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'gxp-drift-alerts-${Environment}'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: Regulation
+          Value: 21-CFR-Part-11
+
+  DriftAlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref DriftAlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertNotificationEmail
+
+  DriftCriticalTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'gxp-drift-critical-${Environment}'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: Regulation
+          Value: 21-CFR-Part-11
+
+  DriftCriticalSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasCriticalEmail
+    Properties:
+      TopicArn: !Ref DriftCriticalTopic
+      Protocol: email
+      Endpoint: !Ref CriticalNotificationEmail
+
+  # =============================================================================
+  # IAM ROLE - Drift Detection Lambda Execution Role
+  # =============================================================================
+  DriftDetectionLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'gxp-drift-detection-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: PublishDriftAlertsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref DriftAlertTopic
+                  - !Ref DriftCriticalTopic
+        - PolicyName: ConfigReadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - config:GetResourceConfigHistory
+                Resource: '*'
+        - PolicyName: SecurityHubImportPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - securityhub:BatchImportFindings
+                Resource: !Sub 'arn:${AWS::Partition}:securityhub:${AWS::Region}:${AWS::AccountId}:product/${AWS::AccountId}/default'
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: Regulation
+          Value: 21-CFR-Part-11
+
+  # =============================================================================
+  # LAMBDA - Drift Detection Handler
+  # =============================================================================
+  DriftDetectionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/gxp-drift-detection-${Environment}'
+      RetentionInDays: 3653
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: Regulation
+          Value: 21-CFR-Part-11
+
+  DriftDetectionFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: DriftDetectionLogGroup
+    Properties:
+      FunctionName: !Sub 'gxp-drift-detection-${Environment}'
+      Description: >
+        Processes AWS Config compliance change events. On NON_COMPLIANT
+        evaluations, publishes a custom finding to AWS Security Hub and an
+        alert to Amazon SNS, escalating high-process-risk resources to a
+        critical topic. Supports GxP change control and periodic review.
+      Runtime: python3.12
+      Handler: handler.handler
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref DriftDetectionLambdaKey
+      Role: !GetAtt DriftDetectionLambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          ALERT_TOPIC_ARN: !Ref DriftAlertTopic
+          CRITICAL_TOPIC_ARN: !Ref DriftCriticalTopic
+          SECURITY_HUB_ENABLED: !Ref SecurityHubEnabled
+      TracingConfig:
+        Mode: Active
+      Tags:
+        - Key: GxP-Classification
+          Value: High-Process-Risk
+        - Key: Regulation
+          Value: 21-CFR-Part-11
+
+  # =============================================================================
+  # EVENTBRIDGE - Config Compliance Change Trigger
+  # =============================================================================
+  ConfigComplianceChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'gxp-drift-config-compliance-change-${Environment}'
+      Description: >
+        Routes AWS Config rule compliance change events to the GxP drift
+        detection Lambda for evaluation and finding generation.
+      EventPattern:
+        source:
+          - aws.config
+        detail-type:
+          - Config Rules Compliance Change
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DriftDetectionFunction.Arn
+          Id: gxp-drift-detection-lambda
+
+  DriftDetectionInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DriftDetectionFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ConfigComplianceChangeRule.Arn
+
+Outputs:
+  DriftDetectionFunctionArn:
+    Description: ARN of the drift detection Lambda function
+    Value: !GetAtt DriftDetectionFunction.Arn
+    Export:
+      Name: !Sub 'gxp-drift-detection-function-arn-${Environment}'
+
+  DriftAlertTopicArn:
+    Description: ARN of the standard drift alert SNS topic
+    Value: !Ref DriftAlertTopic
+    Export:
+      Name: !Sub 'gxp-drift-alert-topic-arn-${Environment}'
+
+  DriftCriticalTopicArn:
+    Description: ARN of the critical (high-process-risk) drift SNS topic
+    Value: !Ref DriftCriticalTopic
+    Export:
+      Name: !Sub 'gxp-drift-critical-topic-arn-${Environment}'
+
+  ConfigComplianceChangeRuleArn:
+    Description: ARN of the EventBridge rule for Config compliance changes
+    Value: !GetAtt ConfigComplianceChangeRule.Arn
